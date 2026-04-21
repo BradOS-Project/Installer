@@ -7,9 +7,9 @@ import json
 import os
 import threading
 
+# Configuration for BradOS
 TARGET = "/mnt"
-LIVE_ROOT = "/"  # in live ISO this becomes your running OS
-
+LIVE_ROOT = "/"  # The running Live ISO root
 
 # =========================
 # SYSTEM HELPERS
@@ -35,116 +35,92 @@ def run(cmd, log=None):
     if process.returncode != 0:
         raise Exception(f"Command failed: {cmd}")
 
-
 # =========================
-# DISK DETECTION (lsblk)
+# DISK DETECTION
 # =========================
 def get_disks():
-    out = subprocess.check_output(
-        "lsblk -J -o NAME,SIZE,TYPE,MOUNTPOINT",
-        shell=True
-    )
-    data = json.loads(out)
-
-    disks = []
-    for d in data["blockdevices"]:
-        if d["type"] == "disk":
-            disks.append(d)
-    return disks
-
+    try:
+        out = subprocess.check_output(
+            "lsblk -J -o NAME,SIZE,TYPE,MOUNTPOINT",
+            shell=True
+        )
+        data = json.loads(out)
+        return [d for d in data["blockdevices"] if d["type"] == "disk"]
+    except Exception:
+        return []
 
 # =========================
-# PARTITIONING
+# PARTITIONING & FORMATTING
 # =========================
 def partition_disk(disk, log):
-    log("Wiping disk...")
-
+    log(f"Wiping and partitioning {disk}...")
     run(f"wipefs -a {disk}", log)
+    
+    # Using MSDOS/MBR for simplicity in BIOS mode
+    run(f"parted {disk} --script mklabel msdos", log)
+    run(f"parted {disk} --script mkpart primary ext4 1MiB 100%", log)
+    
+    return None, disk + "1"
 
-    if os.path.exists("/sys/firmware/efi"):
-        log("UEFI mode detected")
-
-        run(f"parted {disk} --script mklabel gpt", log)
-        run(f"parted {disk} --script mkpart ESP fat32 1MiB 512MiB", log)
-        run(f"parted {disk} --script set 1 esp on", log)
-        run(f"parted {disk} --script mkpart primary ext4 512MiB 100%", log)
-
-        return disk + "1", disk + "2"
-
-    else:
-        log("BIOS mode detected")
-
-        run(f"parted {disk} --script mklabel msdos", log)
-        run(f"parted {disk} --script mkpart primary ext4 1MiB 100%", log)
-
-        return None, disk + "1"
-
-
-# =========================
-# FORMAT + MOUNT
-# =========================
 def format_and_mount(efi, root, log):
-    if efi:
-        run(f"mkfs.fat -F32 {efi}", log)
-
-    run(f"mkfs.ext4 {root}", log)
+    log(f"Formatting {root} as ext4...")
+    run(f"mkfs.ext4 -F {root}", log)
 
     os.makedirs(TARGET, exist_ok=True)
     run(f"mount {root} {TARGET}", log)
 
-    if efi:
-        os.makedirs(f"{TARGET}/boot/efi", exist_ok=True)
-        run(f"mount {efi} {TARGET}/boot/efi", log)
-
-
 # =========================
-# INSTALL OS (THIS IS THE CORE)
+# CORE INSTALLATION LOGIC
 # =========================
-def install_os(log, progress):
+def install_os(log, progress, selected_disk):
     try:
-        progress(10, "Starting install")
+        progress(10, "Copying system files to disk...")
+        
+        # RSYNC EXCLUSIONS: Crucial to prevent infinite loops and virtual files
+        # We exclude /mnt (the target), /proc, /sys, /dev, and /tmp
+        run(f"rsync -a --info=progress2 --exclude='/mnt/*' --exclude='/proc/*' "
+            f"--exclude='/sys/*' --exclude='/dev/*' --exclude='/tmp/*' "
+            f"{LIVE_ROOT} {TARGET}/", log)
 
-        # COPY SYSTEM FILES (THIS IS THE OS INSTALL STEP)
-        run(f"rsync -a --info=progress2 {LIVE_ROOT}/ {TARGET}/", log)
-
-        progress(70, "Installing bootloader")
-
-        # placeholder (replace with real limine-install later)
-        run("limine-install /dev/sda || true", log)
-
-        progress(90, "Writing config")
-
+        progress(70, "Installing Limine Bootloader...")
+        
+        # Create boot directory on target
         os.makedirs(f"{TARGET}/boot", exist_ok=True)
+        
+        # Copy the injected Limine system files to target
+        run(f"cp /usr/share/limine/limine-bios.sys {TARGET}/boot/", log)
+        
+        # Deploy Limine to the MBR of the selected drive
+        run(f"limine bios-install {selected_disk}", log)
 
+        progress(90, "Configuring Bootloader...")
+
+        # Generate target limine.conf
         with open(f"{TARGET}/boot/limine.conf", "w") as f:
-            f.write("""TIMEOUT=5
+            f.write(f"""TIMEOUT=5
+GRAPHICS=yes
 
-:MyOS
+:BradOS
     PROTOCOL=linux
     KERNEL_PATH=/boot/bzImage
-    CMDLINE=root=/dev/sda2 rw
+    CMDLINE=root={selected_disk}1 rw
 """)
 
-        progress(100, "Done")
-
-        messagebox.showinfo("Success", "Installation complete!")
+        progress(100, "Installation Successful!")
+        messagebox.showinfo("Success", "BradOS has been installed! Please reboot and remove your installation media.")
 
     except Exception as e:
-        messagebox.showerror("Error", str(e))
-
+        messagebox.showerror("Installation Error", str(e))
 
 # =========================
-# GUI APP
+# GUI APPLICATION
 # =========================
 class Installer(tk.Tk):
     def __init__(self):
         super().__init__()
-
-        self.title("MyOS Installer")
-        self.geometry("750x500")
-
+        self.title("BradOS Installer")
+        self.geometry("800x550")
         self.selected_disk = None
-
         self.frames = {}
 
         for F in (WelcomePage, DiskPage, InstallPage):
@@ -157,74 +133,53 @@ class Installer(tk.Tk):
     def show(self, page):
         self.frames[page].tkraise()
 
-
-# =========================
-# WELCOME PAGE
-# =========================
 class WelcomePage(tk.Frame):
     def __init__(self, root):
         super().__init__(root)
+        tk.Label(self, text="Welcome to BradOS", font=("Arial", 24, "bold")).pack(pady=50)
+        tk.Label(self, text="This will install the full BradOS environment to your computer.").pack(pady=10)
+        tk.Button(self, text="Begin Installation", font=("Arial", 12),
+                  command=lambda: root.show(DiskPage), width=20, height=2).pack(pady=40)
 
-        tk.Label(self, text="Welcome to MyOS Installer", font=("Arial", 20)).pack(pady=40)
-
-        tk.Button(self, text="Start Installation",
-                  command=lambda: root.show(DiskPage)).pack()
-
-
-# =========================
-# DISK SELECTION PAGE
-# =========================
 class DiskPage(tk.Frame):
     def __init__(self, root):
         super().__init__(root)
-
-        tk.Label(self, text="Select Installation Disk", font=("Arial", 16)).pack(pady=10)
-
+        tk.Label(self, text="Select Installation Target", font=("Arial", 18)).pack(pady=20)
+        
         self.disks = get_disks()
         self.selected = tk.StringVar()
-
         options = [f"/dev/{d['name']} ({d['size']})" for d in self.disks]
 
-        self.combo = ttk.Combobox(self, values=options, textvariable=self.selected)
-        self.combo.pack(pady=10)
+        self.combo = ttk.Combobox(self, values=options, textvariable=self.selected, width=40, state="readonly")
+        self.combo.pack(pady=20)
 
-        tk.Button(self, text="Continue", command=self.confirm).pack(pady=10)
+        tk.Button(self, text="Continue", command=self.confirm, width=15).pack(pady=20)
 
     def confirm(self):
         if self.combo.current() == -1:
-            messagebox.showerror("Error", "Select a disk")
+            messagebox.showerror("Error", "Please select a target disk.")
             return
 
-        disk = "/dev/" + self.disks[self.combo.current()]["name"]
+        disk_name = "/dev/" + self.disks[self.combo.current()]["name"]
+        if messagebox.askyesno("Confirm Erase", f"Are you sure? All data on {disk_name} will be destroyed."):
+            self.master.selected_disk = disk_name
+            self.master.show(InstallPage)
 
-        if not messagebox.askyesno("WARNING", "This will ERASE ALL DATA. Continue?"):
-            return
-
-        if not messagebox.askyesno("FINAL CONFIRM", "Are you absolutely sure?"):
-            return
-
-        self.master.selected_disk = disk
-        self.master.show(InstallPage)
-
-
-# =========================
-# INSTALL PAGE
-# =========================
 class InstallPage(tk.Frame):
     def __init__(self, root):
         super().__init__(root)
-
-        tk.Label(self, text="Installing MyOS...", font=("Arial", 16)).pack(pady=10)
+        self.label = tk.Label(self, text="Installing BradOS...", font=("Arial", 16))
+        self.label.pack(pady=10)
 
         self.progress = tk.IntVar()
-
         self.bar = ttk.Progressbar(self, maximum=100, variable=self.progress)
-        self.bar.pack(fill="x", padx=20, pady=10)
+        self.bar.pack(fill="x", padx=40, pady=20)
 
-        self.log_box = tk.Text(self)
-        self.log_box.pack(fill="both", expand=True)
+        self.log_box = tk.Text(self, bg="black", fg="white", font=("Courier", 10))
+        self.log_box.pack(fill="both", expand=True, padx=20, pady=10)
 
-        tk.Button(self, text="Start Install", command=self.start).pack(pady=10)
+        self.btn_start = tk.Button(self, text="Install Now", command=self.start)
+        self.btn_start.pack(pady=10)
 
     def log(self, msg):
         self.log_box.insert(tk.END, msg + "\n")
@@ -235,25 +190,18 @@ class InstallPage(tk.Frame):
         self.log(msg)
 
     def start(self):
+        self.btn_start.config(state="disabled")
         disk = self.master.selected_disk
+        threading.Thread(target=lambda: self.run_install(disk), daemon=True).start()
 
-        def thread():
-            try:
-                self.log(f"Installing to {disk}")
+    def run_install(self, disk):
+        try:
+            efi, root_part = partition_disk(disk, self.log)
+            format_and_mount(efi, root_part, self.log)
+            install_os(self.log, self.set_progress, disk)
+        except Exception as e:
+            messagebox.showerror("Critical Failure", str(e))
 
-                efi, root = partition_disk(disk, self.log)
-                format_and_mount(efi, root, self.log)
-                install_os(self.log, self.set_progress)
-
-            except Exception as e:
-                messagebox.showerror("Error", str(e))
-
-        threading.Thread(target=thread, daemon=True).start()
-
-
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
     app = Installer()
     app.mainloop()
