@@ -5,24 +5,31 @@ import subprocess
 import json
 import os
 import threading
+import shlex
 
 TARGET = "/mnt"
-LIVE_ROOT = "/" 
+LIVE_ROOT = "/"
 
 def run(cmd, log=None):
-    if log: log(f"$ {cmd}")
-    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    """Execute a shell command and stream output to log."""
+    if log:
+        log(f"$ {cmd}")
+    args = cmd if isinstance(cmd, list) else shlex.split(cmd)
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in process.stdout:
-        if log: log(line.strip())
+        if log:
+            log(line.strip())
     process.wait()
-    if process.returncode != 0: raise Exception(f"Command failed: {cmd}")
+    if process.returncode != 0:
+        raise Exception(f"Command failed: {cmd}")
 
 def get_disks():
     try:
         out = subprocess.check_output("lsblk -J -o NAME,SIZE,TYPE,MOUNTPOINT", shell=True)
         data = json.loads(out)
         return [d for d in data["blockdevices"] if d["type"] == "disk"]
-    except: return []
+    except:
+        return []
 
 def partition_disk(disk, log):
     log(f"Wiping {disk}...")
@@ -40,28 +47,37 @@ def install_os(log, progress, disk):
         run(f"mount {root_part} {TARGET}", log)
 
         progress(30, "Copying system files (Live to Disk)...")
-        # Excludes are vital to prevent recursive copying of /mnt or system virtual files
-        run(f"rsync -a --info=progress2 --exclude='/mnt/*' --exclude='/proc/*' --exclude='/sys/*' --exclude='/dev/*' --exclude='/tmp/*' {LIVE_ROOT} {TARGET}/", log)
+        exclude_opts = [
+            "--exclude=/mnt",
+            "--exclude=/proc",
+            "--exclude=/sys",
+            "--exclude=/dev",
+            "--exclude=/tmp",
+            "--exclude=/run",
+            "--exclude=/lost+found"
+        ]
+        run(["rsync", "-a", "--info=progress2"] + exclude_opts + [LIVE_ROOT, TARGET + "/"], log)
 
         progress(70, "Post-install: Removing installer & adding browser...")
-        # 1. Delete installer shortcut from the INSTALLED disk
         target_desktop = f"{TARGET}/root/Desktop"
-        if os.path.exists(f"{target_desktop}/Install.desktop"):
-            os.remove(f"{target_desktop}/Install.desktop")
+        install_desktop = f"{target_desktop}/Install.desktop"
+        if os.path.exists(install_desktop):
+            os.remove(install_desktop)
 
-        # 2. Add Browser shortcut to the INSTALLED disk
-        with open(f"{target_desktop}/Browser.desktop", "w") as f:
+        os.makedirs(target_desktop, exist_ok=True)
+        browser_desktop = f"{target_desktop}/Browser.desktop"
+        with open(browser_desktop, "w") as f:
             f.write("[Desktop Entry]\nName=Web Browser\nExec=midori\nIcon=web-browser\nType=Application\nTerminal=false\n")
-        run(f"chmod +x {target_desktop}/Browser.desktop", log)
+        os.chmod(browser_desktop, 0o755)
 
-        # 3. Update startup on disk (Remove installer from auto-start)
-        with open(f"{TARGET}/root/.xinitrc", "w") as f:
+        xinitrc_path = f"{TARGET}/root/.xinitrc"
+        with open(xinitrc_path, "w") as f:
             f.write("fluxbox &\npcmanfm --desktop &\nmidori &\n")
 
         progress(85, "Installing Bootloader...")
         os.makedirs(f"{TARGET}/boot", exist_ok=True)
         run(f"cp /usr/share/limine/limine-bios.sys {TARGET}/boot/", log)
-        run(f"limine bios-install {disk}", log)
+        run(["limine", "bios-install", disk], log)
 
         progress(95, "Finalizing config...")
         with open(f"{TARGET}/boot/limine.conf", "w") as f:
@@ -105,7 +121,8 @@ class DiskPage(tk.Frame):
         tk.Button(self, text="Continue", command=self.confirm).pack(pady=20)
 
     def confirm(self):
-        if self.combo.current() == -1: return
+        if self.combo.current() == -1:
+            return
         self.master.selected_disk = "/dev/" + self.disks[self.combo.current()]["name"]
         if messagebox.askyesno("Confirm", "Format drive? All data will be lost."):
             self.master.show(InstallPage)
@@ -123,10 +140,12 @@ class InstallPage(tk.Frame):
         threading.Thread(target=lambda: install_os(self.log, self.set_prog, self.master.selected_disk), daemon=True).start()
 
     def log(self, m):
-        self.log_box.insert("end", m + "\n"); self.log_box.see("end")
+        self.log_box.insert("end", m + "\n")
+        self.log_box.see("end")
 
     def set_prog(self, v, m):
-        self.prog_val.set(v); self.log(m)
+        self.prog_val.set(v)
+        self.log(m)
 
 if __name__ == "__main__":
     Installer().mainloop()
