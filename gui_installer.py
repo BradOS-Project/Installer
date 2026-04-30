@@ -75,13 +75,19 @@ def install_os(log, progress, disk):
             f.write("fluxbox &\npcmanfm --desktop &\nmidori &\n")
 
         progress(85, "Installing Bootloader...")
-        os.makedirs(f"{TARGET}/boot", exist_ok=True)
-        run(f"cp /usr/share/limine/limine-bios.sys {TARGET}/boot/", log)
-        run(["limine", "bios-install", disk], log)
+        grub_dir = f"{TARGET}/boot/grub"
+        os.makedirs(grub_dir, exist_ok=True)
+        run(["grub-install", "--target=i386-pc", f"--boot-directory={TARGET}/boot", disk], log)
 
         progress(95, "Finalizing config...")
-        with open(f"{TARGET}/boot/limine.conf", "w") as f:
-            f.write(f"TIMEOUT=5\nGRAPHICS=yes\n\n:BradOS\n    PROTOCOL=linux\n    KERNEL_PATH=/boot/bzImage\n    CMDLINE=root={root_part} rw\n")
+        with open(f"{grub_dir}/grub.cfg", "w") as f:
+            f.write(
+                "set default=0\n"
+                "set timeout=5\n\n"
+                "menuentry \"BradOS\" {\n"
+                f"    linux /boot/bzImage root={root_part} rw\n"
+                "}\n"
+            )
 
         progress(100, "Done!")
         messagebox.showinfo("Success", "BradOS installed! The installer has been removed from the target. Reboot now.")
